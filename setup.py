@@ -15,11 +15,12 @@ setup(
     zip_safe=True,
     maintainer='ajay',
     maintainer_email='ajay@drone.dev',
-    description='Phase 5 real 3D perception: stereo SGM depth + point cloud from the OAK-D Pro W pair.',
+    description='Phase 5 real 3D perception: stereo SGM depth + point cloud + obstacle extraction from the OAK-D Pro W pair.',
     license='MIT',
     entry_points={
         'console_scripts': [
             'stereo_depth_node = module4_perception.stereo_depth_node:main',
+            'obstacle_extractor_node = module4_perception.obstacle_extractor_node:main',
         ],
     },
 )
