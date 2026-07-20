@@ -22,6 +22,7 @@ setup(
             'stereo_depth_node = module4_perception.stereo_depth_node:main',
             'obstacle_extractor_node = module4_perception.obstacle_extractor_node:main',
             'yolo_detector_node = module4_perception.yolo_detector_node:main',
+            'dataset_recorder = module4_perception.dataset_recorder:main',
         ],
     },
 )
