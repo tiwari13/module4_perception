@@ -23,6 +23,7 @@ setup(
             'obstacle_extractor_node = module4_perception.obstacle_extractor_node:main',
             'yolo_detector_node = module4_perception.yolo_detector_node:main',
             'fusion_node = module4_perception.fusion_node:main',
+            'local_map_node = module4_perception.local_map_node:main',
             'dataset_recorder = module4_perception.dataset_recorder:main',
         ],
     },
