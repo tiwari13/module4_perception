@@ -9,10 +9,14 @@ NEVER gated by AI: every geometric cluster is still published, semantic match or
 not. A YOLO miss cannot make an obstacle disappear; a YOLO hallucination cannot
 conjure one that geometry didn't already see.
 
-Association: project each 3D cluster centroid (left-optical frame, from
+Association: project each 3D cluster's axis-aligned box (left-optical frame, from
 obstacle_extractor_node) into the RGB image using cached /cam_front/rgb/camera_info
-intrinsics, then pick the detection whose 2D box contains that projected point
-(closest box center wins on ties/overlap). No cross-camera extrinsic calibration
+intrinsics -- all 8 corners -> a 2D box -- then pick the detection most covered by it
+(coverage above min_overlap, not IoU: the cluster box is often much larger than a
+YOLO box, so IoU would score a real overlap near zero). Earlier this projected only
+the centroid and required it inside a box; a live sim test showed that near-misses by
+tens of pixels when the cluster and the detection cover different sub-regions, so it
+now matches on box coverage. No cross-camera extrinsic calibration
 exists yet (RGB and left-stereo are co-located on the same rigid mount but not
 extrinsically calibrated) -- so this assumes the two optical centers are
 approximately coincident, which is fine for a coarse "what is this cluster"
@@ -55,11 +59,17 @@ class FusionNode(Node):
         self.declare_parameter('output_topic', '/perception/obstacles_labeled')
         # detections older than this vs the obstacles frame are not used to label it
         self.declare_parameter('detection_max_age_s', 0.5)
+        # min fraction of a YOLO box that must fall inside the cluster's projected
+        # footprint to count as a match (coverage, not IoU -- see _match_box)
+        self.declare_parameter('min_overlap', 0.5)
 
         g = lambda n: self.get_parameter(n).value
         self.max_age = float(g('detection_max_age_s'))
+        self.min_overlap = float(g('min_overlap'))
 
         self.K = None  # (fx, fy, cx, cy) for the RGB camera
+        self.img_w = None  # RGB image width/height (to clip projected boxes)
+        self.img_h = None
         self._latest_dets = None       # Detection2DArray
         self._latest_dets_stamp = 0.0  # wall time of arrival
 
@@ -79,8 +89,11 @@ class FusionNode(Node):
         if self.K is not None:
             return
         self.K = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
+        self.img_w = int(msg.width) or None
+        self.img_h = int(msg.height) or None
         self.get_logger().info(f'rgb intrinsics cached: fx={self.K[0]:.1f} fy={self.K[1]:.1f} '
-                               f'cx={self.K[2]:.1f} cy={self.K[3]:.1f}')
+                               f'cx={self.K[2]:.1f} cy={self.K[3]:.1f} '
+                               f'img={self.img_w}x{self.img_h}')
 
     def _det_cb(self, msg: Detection2DArray):
         self._latest_dets = msg
@@ -95,25 +108,67 @@ class FusionNode(Node):
         v = fy * y / z + cy
         return u, v
 
-    def _match(self, u, v):
-        """Return (class_id, score) of the detection box containing (u,v), or None.
-        Ties broken by whichever box center is closest to (u,v)."""
+    def _project_aabb(self, pos, scale):
+        """Project a cluster's 3D axis-aligned box (center `pos` + `scale` extents,
+        left-optical frame) to a 2D image box (umin, vmin, umax, vmax), clipped to the
+        image. Uses only corners in front of the camera (z>0); returns None if none
+        are, or the box collapses. Projecting the whole box (not just the centroid)
+        is what makes association tolerant of centroid-vs-detection offset."""
+        hx, hy, hz = scale.x / 2.0, scale.y / 2.0, scale.z / 2.0
+        us, vs = [], []
+        for sx in (-hx, hx):
+            for sy in (-hy, hy):
+                for sz in (-hz, hz):
+                    p = self._project(pos.x + sx, pos.y + sy, pos.z + sz)
+                    if p is not None:
+                        us.append(p[0])
+                        vs.append(p[1])
+        if not us:
+            return None
+        umin, umax = min(us), max(us)
+        vmin, vmax = min(vs), max(vs)
+        if self.img_w:
+            umin, umax = max(0.0, umin), min(float(self.img_w), umax)
+        if self.img_h:
+            vmin, vmax = max(0.0, vmin), min(float(self.img_h), vmax)
+        if umax <= umin or vmax <= vmin:
+            return None
+        return (umin, vmin, umax, vmax)
+
+    @staticmethod
+    def _coverage(cluster_box, det_box):
+        """Fraction of `det_box` that lies inside `cluster_box` (both xmin,ymin,xmax,
+        ymax). This, not IoU, is the right metric: a merged cluster's projected box is
+        often much larger than one YOLO box, and IoU (÷ union) would score a true
+        overlap near zero. Coverage (÷ detection area) asks 'is this detection sitting
+        on this obstacle?' and is immune to the cluster box being large."""
+        ix0, iy0 = max(cluster_box[0], det_box[0]), max(cluster_box[1], det_box[1])
+        ix1, iy1 = min(cluster_box[2], det_box[2]), min(cluster_box[3], det_box[3])
+        iw, ih = ix1 - ix0, iy1 - iy0
+        if iw <= 0 or ih <= 0:
+            return 0.0
+        det_area = (det_box[2] - det_box[0]) * (det_box[3] - det_box[1])
+        return (iw * ih) / det_area if det_area > 0 else 0.0
+
+    def _match_box(self, box2d):
+        """Return (class_id, score) of the detection best covered by the cluster's
+        projected box (coverage above min_overlap), or None. Replaces the old
+        centroid-in-box test: overlap, not a single point, so a cluster whose centroid
+        near-misses a box still matches when the box sits within its footprint."""
         if self._latest_dets is None:
             return None
         if (time.time() - self._latest_dets_stamp) > self.max_age:
             return None
         best = None
-        best_d2 = None
+        best_cov = self.min_overlap
         for d in self._latest_dets.detections:
-            bx, by = d.bbox.center.position.x, d.bbox.center.position.y
-            hw, hh = d.bbox.size_x / 2.0, d.bbox.size_y / 2.0
-            if not (bx - hw <= u <= bx + hw and by - hh <= v <= by + hh):
-                continue
             if not d.results:
                 continue
-            d2 = (u - bx) ** 2 + (v - by) ** 2
-            if best_d2 is None or d2 < best_d2:
-                best_d2 = d2
+            bx, by = d.bbox.center.position.x, d.bbox.center.position.y
+            hw, hh = d.bbox.size_x / 2.0, d.bbox.size_y / 2.0
+            cov = self._coverage(box2d, (bx - hw, by - hh, bx + hw, by + hh))
+            if cov > best_cov:
+                best_cov = cov
                 hyp = d.results[0].hypothesis
                 best = (hyp.class_id, float(hyp.score))
         return best
@@ -129,10 +184,9 @@ class FusionNode(Node):
             n_boxes += 1
             label = None
             if self.K is not None:
-                proj = self._project(m.pose.position.x, m.pose.position.y,
-                                     m.pose.position.z)
-                if proj is not None:
-                    label = self._match(*proj)
+                box2d = self._project_aabb(m.pose.position, m.scale)
+                if box2d is not None:
+                    label = self._match_box(box2d)
 
             box = Marker()
             box.header = m.header
