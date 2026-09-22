@@ -31,6 +31,19 @@ interface is built (Phase 6/7).
 
 Run (sim + bridge + spawn_landmarks + stereo_depth_node up):
   ros2 run module4_perception obstacle_extractor_node
+
+Phase 11 multi-camera: this node stays single-camera by design (one cloud in,
+one markers topic out, no camera-identity concept) -- run one instance per
+physical unit, remapped to that unit's own point topic and a unit-suffixed
+output topic that local_map_node.py's default `units` param expects:
+  ros2 run module4_perception obstacle_extractor_node --ros-args \
+    -p cloud_topic:=/cam_front/points -p markers_topic:=/perception/obstacles_front
+  ros2 run module4_perception obstacle_extractor_node --ros-args \
+    -p cloud_topic:=/cam_rear/points  -p markers_topic:=/perception/obstacles_rear
+  ros2 run module4_perception obstacle_extractor_node --ros-args \
+    -p cloud_topic:=/cam_left/points  -p markers_topic:=/perception/obstacles_left
+  ros2 run module4_perception obstacle_extractor_node --ros-args \
+    -p cloud_topic:=/cam_right/points -p markers_topic:=/perception/obstacles_right
 """
 
 import time
