@@ -171,6 +171,15 @@ class LocalMapNode(Node):
         self.declare_parameter('map_radius_m', 20.0)    # prune beyond this
         self.declare_parameter('sweep_period_s', 0.5)   # decay/prune tick rate
         self.declare_parameter('position_timeout_s', 1.0)
+        # Underground guard (2026-09-24): stereo on a textureless surface can
+        # back-project ground pixels at garbage depths 0.5-2 m BELOW the real
+        # ground; nothing downstream rejects such physically impossible
+        # obstacles. Ground height = PX4 dist_bottom when valid (rangefinder /
+        # terrain estimate), else ground_z_ned. LIMITATION of the fallback: it
+        # assumes flat ground at takeoff height -- flying off a hill, a real
+        # obstacle below takeoff level would be clipped.
+        self.declare_parameter('ground_z_ned', 0.0)          # EKF origin = takeoff ground
+        self.declare_parameter('below_ground_margin_m', 0.5)  # one voxel of stereo slack
         self.declare_parameter('attitude_timeout_s', 1.0)
 
         g = lambda n: self.get_parameter(n).value
@@ -178,6 +187,10 @@ class LocalMapNode(Node):
         self.decay_s = float(g('decay_s'))
         self.map_radius_m = float(g('map_radius_m'))
         self.position_timeout = float(g('position_timeout_s'))
+        self.ground_z_fallback = float(g('ground_z_ned'))
+        self.below_ground_margin = float(g('below_ground_margin_m'))
+        self.ground_z = self.ground_z_fallback   # NED z of the ground (down+)
+        self._n_underground_dropped = 0
         self.attitude_timeout = float(g('attitude_timeout_s'))
         units = list(g('units'))
         topic_template = g('obstacles_topic_template')
@@ -236,6 +249,11 @@ class LocalMapNode(Node):
             return
         self.drone_pos = np.array([msg.x, msg.y, msg.z], dtype=np.float64)
         self._last_pos_update = time.monotonic()
+        # ground is dist_bottom BELOW the drone (NED: +dist_bottom in z)
+        if msg.dist_bottom_valid and np.isfinite(msg.dist_bottom):
+            self.ground_z = float(msg.z + msg.dist_bottom)
+        else:
+            self.ground_z = self.ground_z_fallback
 
     def _position_healthy(self) -> bool:
         return (self.drone_pos is not None and
@@ -290,10 +308,33 @@ class LocalMapNode(Node):
             # misplaces every obstacle in world XY under any real attitude.
             center_world = self.drone_pos + self.R_ned_body @ center_body
 
+            clipped = self._clip_underground(center_world, half_body)
+            if clipped is None:
+                self._n_underground_dropped += 1
+                continue
+            center_world, half_body = clipped
+
             self._mark_voxels_in_aabb(center_world, half_body, now)
             n_marked += 1
 
         self._n_updates_since_log += n_marked
+
+    def _clip_underground(self, center_world, half_extent):
+        """Clip an obstacle box (world NED, z down+) at ground + margin.
+        Returns None if the whole box is underground (physically impossible
+        -- see the ground_z_ned param comment), else the (center, half)
+        of its above-ground part."""
+        limit = self.ground_z + self.below_ground_margin   # deepest allowed z
+        top = center_world[2] - half_extent[2]              # smallest z = highest
+        bottom = center_world[2] + half_extent[2]
+        if top > limit:
+            return None
+        if bottom <= limit:
+            return center_world, half_extent
+        center, half = center_world.copy(), half_extent.copy()
+        center[2] = (top + limit) / 2.0
+        half[2] = (limit - top) / 2.0
+        return center, half
 
     def _mark_voxels_in_aabb(self, center_world, half_extent, stamp):
         lo = np.floor((center_world - half_extent) / self.voxel_size).astype(int)
@@ -359,9 +400,12 @@ class LocalMapNode(Node):
         if dt >= 2.0:
             self.get_logger().info(
                 f'local_map: {len(self.voxels)} occupied voxels '
-                f'({self._n_updates_since_log} cluster updates in last {dt:.1f}s)')
+                f'({self._n_updates_since_log} cluster updates in last {dt:.1f}s, '
+                f'{self._n_underground_dropped} underground dropped, '
+                f'ground_z={self.ground_z:.2f})')
             self._t_last_log = now
             self._n_updates_since_log = 0
+            self._n_underground_dropped = 0
 
 
 def main(args=None):

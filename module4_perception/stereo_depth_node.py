@@ -39,6 +39,14 @@ from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 import message_filters
 
 
+def _texture_score(img: np.ndarray, block: int) -> np.ndarray:
+    """Per-pixel texture confidence: mean |horizontal gradient| over a
+    block x block window. Horizontal because stereo matching searches along
+    rows -- no left-right intensity change means nothing to match."""
+    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+    return cv2.blur(np.abs(gx), (block, block))
+
+
 class StereoDepthNode(Node):
     def __init__(self):
         super().__init__('stereo_depth_node')
@@ -50,6 +58,16 @@ class StereoDepthNode(Node):
         self.declare_parameter('block_size', 7)            # SGBM matched block (odd)
         self.declare_parameter('min_range_m', 0.3)         # clip near
         self.declare_parameter('max_range_m', 20.0)        # clip far
+        # Texture confidence (2026-09-29): reject disparity where the left
+        # image has too little horizontal texture for matching to mean
+        # anything. SGBM's smoothness term otherwise "streaks" an object's
+        # disparity sideways into featureless background (sky) along image
+        # rows -- a 1.5 m test box came out 6.6 m wide, 1.8 m off-centre.
+        # Real stereo pipelines gate on this too (OpenCV StereoBM's
+        # textureThreshold, OAK-D's on-device confidence threshold).
+        # Score = block-mean |Sobel x| on the downsampled left image.
+        # 0 = disabled (previous behaviour).
+        self.declare_parameter('texture_threshold', 0.0)
         self.declare_parameter('publish_cloud', True)
         self.declare_parameter('left_image',  '/cam_front/left/image_raw')
         self.declare_parameter('right_image', '/cam_front/right/image_raw')
@@ -63,11 +81,13 @@ class StereoDepthNode(Node):
         self.min_range = float(g('min_range_m'))
         self.max_range = float(g('max_range_m'))
         self.publish_cloud = bool(g('publish_cloud'))
+        self.texture_threshold = float(g('texture_threshold'))
 
         # SGBM needs num_disparities divisible by 16; round up defensively.
         nd = int(g('num_disparities'))
         nd = max(16, ((nd + 15) // 16) * 16)
         bs = int(g('block_size')) | 1  # force odd
+        self.block_size = bs
         self.matcher = cv2.StereoSGBM_create(
             minDisparity=0,
             numDisparities=nd,
@@ -104,7 +124,7 @@ class StereoDepthNode(Node):
         self.get_logger().info(
             f'stereo_depth_node up: scale={self.scale} baseline={self.baseline}m '
             f'numDisp={nd} block={bs} range=[{self.min_range},{self.max_range}]m '
-            f'cloud={self.publish_cloud}')
+            f'texture_threshold={self.texture_threshold} cloud={self.publish_cloud}')
 
     # ── intrinsics ─────────────────────────────────────────────────────────────
     def _info_cb(self, msg: CameraInfo):
@@ -142,6 +162,8 @@ class StereoDepthNode(Node):
         # depth: Z = fx * baseline / disparity. Invalid disparity -> NaN (honest
         # holes, not fake zeros — real stereo has no data on textureless regions).
         valid = disp > 0.0
+        if self.texture_threshold > 0.0:
+            valid &= _texture_score(limg, self.block_size) >= self.texture_threshold
         depth = np.full((h, w), np.nan, dtype=np.float32)
         np.divide(fx * self.baseline, disp, out=depth, where=valid)
         # clip to a sane working range; out-of-range -> NaN
