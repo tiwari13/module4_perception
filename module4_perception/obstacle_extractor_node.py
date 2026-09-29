@@ -117,6 +117,33 @@ def _voxel_downsample(xyz: np.ndarray, size: float) -> np.ndarray:
     return xyz[np.sort(idx)]
 
 
+def _estimate_floor(height: np.ndarray, min_fraction: float,
+                    fallback_pct: float, bin_m: float = 0.05) -> float:
+    """Floor height from where ground points actually ARE, not the low tail.
+
+    The old rule (5th-percentile height) is defined by the lowest 5% of
+    points, so a few below-ground stereo outliers (depth noise at 4-5 m)
+    dragged it 0.2+ m under the real ground and whole strips of textured
+    ground survived as 'obstacles' (C-groundclutter, 2026-09-29).
+    Ground is a DENSE horizontal band; a wall spreads over many heights. So:
+    histogram heights in bin_m bins, keep bins holding >= min_fraction of
+    the points, and take the LOWEST such bin (lowest, not densest, so a big
+    table-top above the ground isn't mistaken for it). No dense band (no
+    ground in view) -> fall back to the old percentile."""
+    n = height.size
+    if n == 0:
+        return float('-inf')
+    lo, hi = float(height.min()), float(height.max())
+    if hi - lo < bin_m:
+        return lo
+    counts, edges = np.histogram(height, bins=np.arange(lo, hi + bin_m, bin_m))
+    dense = np.nonzero(counts >= min_fraction * n)[0]
+    if dense.size == 0:
+        return float(np.percentile(height, fallback_pct))
+    i = int(dense[0])
+    return float((edges[i] + edges[i + 1]) / 2.0)
+
+
 def _ransac_ground(xyz: np.ndarray, thresh: float, iters: int,
                    up_axis: int, min_vertical: float, rng: np.random.Generator):
     """Return a boolean mask of GROUND (plane) inliers.
@@ -165,13 +192,22 @@ class ObstacleExtractorNode(Node):
         # gravity-aligned ground removal (preferred over RANSAC when attitude is live)
         self.declare_parameter('attitude_topic', '/fmu/out/vehicle_attitude')
         self.declare_parameter('ground_margin', 0.30)     # m above floor still = ground
-        self.declare_parameter('floor_percentile', 5.0)   # low %ile of height = floor
+        self.declare_parameter('floor_percentile', 5.0)   # fallback floor (see _estimate_floor)
+        self.declare_parameter('floor_min_fraction', 0.10)  # dense-band share to count as ground
         self.declare_parameter('attitude_timeout_s', 1.0) # older -> fall back to RANSAC
         self.declare_parameter('cluster_eps', 0.5)        # m; DBSCAN neighborhood
         self.declare_parameter('cluster_min_samples', 10)
         self.declare_parameter('min_cluster_points', 15)  # drop tiny clusters
         # optical frame: x right, y DOWN, z forward -> 'up' is the y axis (index 1)
         self.declare_parameter('up_axis', 1)
+        # Which calibration.yaml unit this instance's camera is (e.g. cam_rear).
+        # Gravity ground removal needs THIS camera's body<-optical rotation:
+        # using the front mount for every camera gives correct heights only
+        # while the drone is level (mounts differ only in yaw); under roll/
+        # pitch the side/rear cameras' ground comes out tilted and leaks
+        # through as obstacles (C-groundclutter, 2026-09-29). Empty = front
+        # (previous single-camera behaviour).
+        self.declare_parameter('calibration_unit', '')
 
         g = lambda n: self.get_parameter(n).value
         self.voxel = float(g('voxel_size'))
@@ -186,7 +222,17 @@ class ObstacleExtractorNode(Node):
         self.up_axis = int(g('up_axis'))
         self.ground_margin = float(g('ground_margin'))
         self.floor_pct = float(g('floor_percentile'))
+        self.floor_min_fraction = float(g('floor_min_fraction'))
         self.att_timeout = float(g('attitude_timeout_s'))
+        unit = str(g('calibration_unit'))
+        if unit:
+            # same loader/convention local_map_node uses (fails loud)
+            from module4_perception.local_map_node import _load_unit_mounts
+            self.R_body_cam = _load_unit_mounts([unit])[unit][0]
+        else:
+            self.R_body_cam = R_BODY_CAM
+        self.get_logger().info(
+            f"ground-removal mount: {unit or 'front (default)'}")
 
         self.rng = np.random.default_rng(0)
         self._t_last_log = time.time()
@@ -221,15 +267,17 @@ class ObstacleExtractorNode(Node):
         R_ned_body = _quat_to_R(w, x, y, z)
         # world<-cam = (NED<-body)(body<-cam); we treat NED as the gravity frame
         # (its z axis is DOWN, so 'height up' = -z_ned below).
-        self.R_world_cam = R_ned_body @ R_BODY_CAM
+        self.R_world_cam = R_ned_body @ self.R_body_cam  # this camera's own mount
         self._att_stamp = time.time()
 
     def _gravity_ground_mask(self, xyz):
         """Ground inliers via a height cut in the gravity-aligned frame.
 
-        Rotates points to NED, takes height = -z_ned (up positive), calls the
-        low percentile the floor level, and marks everything within
-        [floor, floor+margin] as ground. Returns None if attitude is unavailable
+        Rotates points to NED (with THIS camera's mount), takes height =
+        -z_ned (up positive), estimates the floor as the lowest dense height
+        band (_estimate_floor), and marks everything at or below
+        floor+margin as ground (below-floor points are outliers, not
+        obstacles). Returns None if attitude is unavailable
         or stale (caller falls back to RANSAC).
         """
         if self.R_world_cam is None:
@@ -238,7 +286,7 @@ class ObstacleExtractorNode(Node):
             return None
         ned = xyz @ self.R_world_cam.T          # (N,3) in NED
         height = -ned[:, 2]                      # NED z is down -> up is -z
-        floor = np.percentile(height, self.floor_pct)
+        floor = _estimate_floor(height, self.floor_min_fraction, self.floor_pct)
         return height <= (floor + self.ground_margin)
 
     def _cb(self, cloud: PointCloud2):
