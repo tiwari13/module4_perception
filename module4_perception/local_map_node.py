@@ -151,8 +151,17 @@ def _load_unit_mounts(unit_names):
                 f"composition below assumes yaw-only mounts (true for the "
                 f"current front/rear/left/right rig); extend _load_unit_mounts "
                 f"before adding a tilted or upward/downward unit.")
-        R_body_cam = _rotz(yaw) @ R_BODY_CAM_FWD
-        t_body_mount = np.array(mount['translation'], dtype=np.float64)
+        # calibration.yaml's T_base_link_unit is REP-103 base_link = FLU
+        # (x fwd, y LEFT, z up; SDF convention -- see its `frames:` block),
+        # but everything here is body FRD (y RIGHT, z down). Convert:
+        # yaw flips sign, translation y/z flip sign. Using the FLU numbers
+        # directly mirrored the LEFT and RIGHT cameras (front/rear, yaw 0 and
+        # 180 deg, are identical either way, which hid it) -- found in Phase
+        # 11 run 4 (2026-09-30): the path-ahead box showed up on the wrong side.
+        yaw_frd = -yaw
+        R_body_cam = _rotz(yaw_frd) @ R_BODY_CAM_FWD
+        tx, ty, tz = (float(v) for v in mount['translation'])
+        t_body_mount = np.array([tx, -ty, -tz], dtype=np.float64)
         mounts[unit] = (R_body_cam, t_body_mount)
     return mounts
 
