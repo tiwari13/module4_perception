@@ -20,7 +20,8 @@ Inputs (ApproximateTime-synced on the two images; camera_info cached separately)
   /cam_front/left/camera_info  (intrinsics, read once)
 
 Outputs:
-  /cam_front/depth/image       (32FC1, metres; NaN where disparity is invalid)
+  /cam_front/depth/image       (32FC1, metres; REP-117: NaN = invalid or too near,
+                                +inf = matched but beyond max_range_m)
   /cam_front/points            (organized PointCloud2, XYZ, left optical frame)
 
 Run (sim up + full bridge incl. stereo + spawn_landmarks for texture):
@@ -167,9 +168,18 @@ class StereoDepthNode(Node):
         depth = np.full((h, w), np.nan, dtype=np.float32)
         np.divide(fx * self.baseline, disp, out=depth, where=valid)
         # clip to a sane working range; out-of-range -> NaN
-        depth[(depth < self.min_range) | (depth > self.max_range)] = np.nan
+        far = depth > self.max_range  # matched (disparity > 0), but beyond range
+        depth[(depth < self.min_range) | far] = np.nan
 
-        self._publish_depth(depth, left.header)
+        # Depth IMAGE follows REP-117: NaN = no valid measurement, +inf = matched
+        # but beyond max_range ("nothing within range"). The safety supervisor
+        # needs the difference: far textured ground is evidence of free space, a
+        # blank wall (no match) is not. Too-near and texture-rejected stay NaN:
+        # for a safety input, unknown is the conservative answer. The CLOUD keeps
+        # NaN for both, so it is unchanged for obstacle_extractor_node.
+        depth_img = depth.copy()
+        depth_img[far] = np.inf
+        self._publish_depth(depth_img, left.header)
         if self.pub_cloud is not None:
             self._publish_cloud(depth, left.header, fx, fy, cx, cy)
 
